@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-X (Twitter) 取关管理工具
+X (Twitter) 关注管理工具
 ========================
-拉取关注列表与粉丝列表，找出未回关你的用户，排除白名单后一键取关。
+拉取关注列表与粉丝列表，支持一键取关未回关你的人，及一键回关关注了你但你没回关的人。
 """
 
 from __future__ import annotations
@@ -248,20 +248,20 @@ class XClient:
         resp = self.client.post(url, headers=headers, data=data)
 
         if resp.status_code in (401, 403):
-            log.error("❌ 取关操作被拒绝 (HTTP %d) — Cookie 可能已失效", resp.status_code)
+            log.error("❌ 操作被拒绝 (HTTP %d) — Cookie 可能已失效", resp.status_code)
             return False
 
         if resp.status_code == 429:
             wait = int(resp.headers.get("x-rate-limit-reset", 900))
             wait = max(30, wait - int(time.time())) + 3
-            log.warning("⚠️  取关限速 (429)，等待 %d 秒...", wait)
+            log.warning("⚠️  限速 (429)，等待 %d 秒...", wait)
             time.sleep(wait)
             resp = self.client.post(url, headers=headers, data=data)
 
         if resp.status_code in (200, 201):
             return True
 
-        log.error("❌ 取关失败 HTTP %d: %s", resp.status_code, resp.text[:200])
+        log.error("❌ 失败 HTTP %d: %s", resp.status_code, resp.text[:200])
         return False
 
     def resolve_username(self, username: str) -> Optional[dict[str, Any]]:
@@ -390,6 +390,10 @@ class XClient:
         """取关单个用户。"""
         return self._rest_post("friendships/destroy.json", {"user_id": user_id})
 
+    def follow_user(self, user_id: str) -> bool:
+        """关注单个用户。"""
+        return self._rest_post("friendships/create.json", {"user_id": user_id})
+
 
 # ── 交互界面 ──────────────────────────────────────────────────────────────
 
@@ -397,8 +401,8 @@ class XClient:
 def print_banner() -> None:
     print()
     print("══════════════════════════════════════════")
-    print("  X/Twitter 取关管理工具")
-    print("  找出未回关你的人，一键取关")
+    print("  X/Twitter 关注管理工具")
+    print("  取关未回关 · 回关未关注的粉丝")
     print("══════════════════════════════════════════")
     print()
 
@@ -409,6 +413,7 @@ def print_results(
     mutual_count: int,
     non_mutual: list[dict[str, Any]],
     whitelist_ids: set[str],
+    not_followed_back: list[dict[str, Any]] | None = None,
 ) -> None:
     """显示分析结果摘要。"""
     whitelist_non_mutual = [u for u in non_mutual if u["id"] in whitelist_ids]
@@ -420,13 +425,17 @@ def print_results(
     print(f"  关注了:    {following_count} 人")
     print(f"  粉丝:      {followers_count} 人")
     print(f"  互相关注:  {mutual_count} 人")
+    print(f"  ──")
     print(f"  未回关你:  {len(non_mutual)} 人")
     if whitelist_non_mutual:
         print(f"  白名单豁免: {len(whitelist_ids)} 人 (其中未回关: {len(whitelist_non_mutual)} 人)")
     else:
         print(f"  白名单:    {len(whitelist_ids)} 人")
-    print(f"  ──")
     print(f"  本次可取关: {len(actionable)} 人")
+    if not_followed_back is not None:
+        print(f"  ──")
+        print(f"  你未回关:  {len(not_followed_back)} 人")
+        print(f"  本次可回关: {len(not_followed_back)} 人")
     print("──────────────────────────────────────────")
     print()
 
@@ -509,6 +518,61 @@ def execute_unfollow(
     return state
 
 
+def execute_followback(
+    x: XClient,
+    to_follow: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """执行批量回关。"""
+    total = len(to_follow)
+    followed = state.get("followed", [])
+    errors = state.get("follow_errors", [])
+
+    print(f"\n准备回关 {total} 人...")
+    print(f"  已回关: {len(followed)} 人")
+    print(f"  剩余:   {total - len(followed)} 人")
+
+    if not confirm_action(f"确定要回关这 {total - len(followed)} 人吗？"):
+        print("  已取消。")
+        return state
+
+    for i, u in enumerate(to_follow):
+        uid = u["id"]
+        username = u["username"]
+
+        # 跳过已完成的
+        if uid in followed:
+            continue
+
+        # 进度显示
+        progress = f"[{i + 1}/{total}]"
+        print(f"  {progress} 回关 @{username}...", end=" ", flush=True)
+
+        if x.follow_user(uid):
+            print("✅")
+            followed.append(uid)
+        else:
+            print("❌")
+            errors.append({"id": uid, "username": username})
+
+        # 保存断点
+        state["followed"] = followed
+        state["follow_errors"] = errors
+        save_state(state)
+
+        # 每 50 人暂停 30 秒
+        if (i + 1) % 50 == 0 and i + 1 < total:
+            print(f"  ⏸  已回关 {i + 1}/{total}，暂停 30 秒...")
+            time.sleep(30)
+
+        # 每次回关间隔 1 秒
+        if i + 1 < total:
+            time.sleep(1.0)
+
+    print(f"\n✅ 回关完成: {len(followed)} 成功, {len(errors)} 失败")
+    return state
+
+
 # ── 主入口 ────────────────────────────────────────────────────────────────
 
 
@@ -580,26 +644,41 @@ def main() -> None:
         for uid in following_ids
         if uid not in followers_ids
     ]
+    # 关注了你但你未回关的人（粉丝列表中不在关注列表中的）
+    not_followed_back = [u for u in followers if u["id"] not in following_ids]
     actionable = [u for u in non_mutual if u["id"] not in whitelist_ids]
 
-    print_results(len(following), len(followers), mutual_count, non_mutual, whitelist_ids)
+    print_results(
+        len(following), len(followers), mutual_count,
+        non_mutual, whitelist_ids, not_followed_back,
+    )
 
     # 7. 加载断点状态
     state = load_state()
     state.setdefault("unfollowed", [])
     state.setdefault("errors", [])
+    state.setdefault("followed", [])
+    state.setdefault("follow_errors", [])
 
     # 8. 交互菜单
     while True:
         print()
-        print("操作:")
-        print("  [L] 列出未回关用户")
-        print("  [D] 预览取关（dry-run，不执行）")
+        print("──── 取关 ────")
+        print("  [L]  列出未回关你的用户")
         if actionable:
             remaining = len(actionable) - len(state.get("unfollowed", []))
-            print(f"  [U] 执行取关 ({remaining} 人待处理)")
-        print("  [W] 添加用户到白名单")
-        print("  [Q] 退出")
+            print(f"  [U]  执行取关 ({remaining} 人待处理)")
+        print("  [D]  预览取关（dry-run）")
+        print()
+        print("──── 回关 ────")
+        print(f"  [LF] 列出你未回关的粉丝 ({len(not_followed_back)} 人)")
+        if not_followed_back:
+            remaining_fb = len(not_followed_back) - len(state.get("followed", []))
+            print(f"  [F]  执行回关 ({remaining_fb} 人待处理)")
+        print()
+        print("──── 其他 ────")
+        print("  [W]  添加用户到白名单")
+        print("  [Q]  退出")
         print()
 
         try:
@@ -610,6 +689,9 @@ def main() -> None:
 
         if choice == "L":
             list_non_mutual(non_mutual, whitelist_ids)
+
+        elif choice == "LF":
+            list_non_mutual(not_followed_back, set())
 
         elif choice == "D":
             print(f"\n即将取关以下 {len(actionable)} 人（dry-run，不会执行）：")
@@ -626,6 +708,18 @@ def main() -> None:
                 print("所有用户已取关完毕！")
                 continue
             state = execute_unfollow(x, remaining, state)
+            # 刷新状态
+            state = load_state()
+
+        elif choice == "F":
+            if not not_followed_back:
+                print("没有需要回关的用户。")
+                continue
+            remaining_fb = [u for u in not_followed_back if u["id"] not in state.get("followed", [])]
+            if not remaining_fb:
+                print("所有用户已回关完毕！")
+                continue
+            state = execute_followback(x, remaining_fb, state)
             # 刷新状态
             state = load_state()
 
