@@ -3,6 +3,7 @@
 
 # 个人数据（不要提交到版本控制）
 whitelist.txt
+blacklist.txt
 state.json
 
 # Python

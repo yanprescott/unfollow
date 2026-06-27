@@ -22,6 +22,7 @@ import httpx
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 WHITELIST_PATH = BASE_DIR / "whitelist.txt"
+BLACKLIST_PATH = BASE_DIR / "blacklist.txt"
 STATE_PATH = BASE_DIR / "state.json"
 
 # ── 日志 ──────────────────────────────────────────────────────────────────
@@ -117,6 +118,35 @@ def add_to_whitelist(username: str) -> None:
     with open(WHITELIST_PATH, "a", encoding="utf-8") as fh:
         fh.write(f"{clean}\n")
     log.info("  ✅ @%s 已添加到白名单", clean)
+
+
+# ── 黑名单 ────────────────────────────────────────────────────────────────
+
+
+def load_blacklist() -> set[str]:
+    """从 blacklist.txt 加载黑名单用户名（lowercase）。"""
+    if not BLACKLIST_PATH.exists():
+        return set()
+    names: set[str] = set()
+    with open(BLACKLIST_PATH, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            names.add(line.lower().lstrip("@"))
+    return names
+
+
+def add_to_blacklist(username: str) -> None:
+    """将用户名追加到黑名单文件。"""
+    clean = username.lower().lstrip("@")
+    existing = load_blacklist()
+    if clean in existing:
+        log.info("  @%s 已在黑名单中", clean)
+        return
+    with open(BLACKLIST_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"{clean}\n")
+    log.info("  ✅ @%s 已添加到黑名单", clean)
 
 
 # ── 状态持久化（增量取关断点续传）──────────────────────────────────────────
@@ -414,6 +444,7 @@ def print_results(
     non_mutual: list[dict[str, Any]],
     whitelist_ids: set[str],
     not_followed_back: list[dict[str, Any]] | None = None,
+    blacklist_ids: set[str] | None = None,
 ) -> None:
     """显示分析结果摘要。"""
     whitelist_non_mutual = [u for u in non_mutual if u["id"] in whitelist_ids]
@@ -433,20 +464,34 @@ def print_results(
         print(f"  白名单:    {len(whitelist_ids)} 人")
     print(f"  本次可取关: {len(actionable)} 人")
     if not_followed_back is not None:
+        fb_blacklisted = [u for u in not_followed_back if u["id"] in (blacklist_ids or set())]
+        fb_actionable = [u for u in not_followed_back if u["id"] not in (blacklist_ids or set())]
         print(f"  ──")
         print(f"  你未回关:  {len(not_followed_back)} 人")
-        print(f"  本次可回关: {len(not_followed_back)} 人")
+        if fb_blacklisted:
+            print(f"  黑名单豁免: {len(blacklist_ids or set())} 人 (其中未回关: {len(fb_blacklisted)} 人)")
+        print(f"  本次可回关: {len(fb_actionable)} 人")
     print("──────────────────────────────────────────")
     print()
 
 
-def list_non_mutual(non_mutual: list[dict[str, Any]], whitelist_ids: set[str]) -> None:
+def list_non_mutual(
+    non_mutual: list[dict[str, Any]],
+    whitelist_ids: set[str],
+    blacklist_ids: set[str] | None = None,
+) -> None:
     """列出未回关用户。"""
     print()
     print(f"{'#':>4}  {'用户名':<20} {'显示名':<25} {'粉丝':>8} {'关注':>8} {'状态'}")
     print("-" * 85)
     for i, u in enumerate(non_mutual, 1):
-        status = "⚪ 白名单" if u["id"] in whitelist_ids else "🔴 可取关"
+        uid = u["id"]
+        if blacklist_ids is not None and uid in blacklist_ids:
+            status = "⛔ 黑名单"
+        elif uid in whitelist_ids:
+            status = "⚪ 白名单"
+        else:
+            status = "🔴 可取关"
         print(
             f"{i:>4}  @{u['username']:<19} {u['name'][:24]:<25} "
             f"{u['followers_count']:>8,} {u['friends_count']:>8,} {status}"
@@ -613,31 +658,40 @@ def main() -> None:
     followers_ids = {u["id"] for u in followers}
     log.info("  粉丝: %d 人", len(followers))
 
-    # 5. 加载白名单并解析 user_id
+    # 5. 加载白名单
     log.info("正在加载白名单...")
     whitelist_names = load_whitelist()
     log.info("  白名单用户名: %d 个", len(whitelist_names))
 
-    whitelist_ids: set[str] = set()
-    for name in whitelist_names:
-        # 先在关注列表中查找（无需额外 API 请求）
-        found = False
-        for uid, uinfo in following_ids.items():
-            if uinfo["username"].lower() == name:
-                whitelist_ids.add(uid)
-                found = True
-                break
-        if not found:
-            # 尝试通过 API 解析
-            user_info = x.resolve_username(name)
-            if user_info:
-                whitelist_ids.add(user_info["id"])
-                log.info("  白名单 @%s → id=%s", name, user_info["id"])
-            else:
-                log.warning("  ⚠️  白名单用户 @%s 未找到", name)
+    def _resolve_names(names: set[str]) -> set[str]:
+        """将一批用户名解析为 user_id 集合。"""
+        ids: set[str] = set()
+        for name in names:
+            found = False
+            for uid, uinfo in following_ids.items():
+                if uinfo["username"].lower() == name:
+                    ids.add(uid)
+                    found = True
+                    break
+            if not found:
+                user_info = x.resolve_username(name)
+                if user_info:
+                    ids.add(user_info["id"])
+                else:
+                    log.warning("  ⚠️  用户 @%s 未找到", name)
+        return ids
+
+    whitelist_ids = _resolve_names(whitelist_names)
     log.info("  白名单解析: %d 个 user_id", len(whitelist_ids))
 
-    # 6. 计算差集
+    # 6. 加载黑名单
+    log.info("正在加载黑名单...")
+    blacklist_names = load_blacklist()
+    log.info("  黑名单用户名: %d 个", len(blacklist_names))
+    blacklist_ids = _resolve_names(blacklist_names)
+    log.info("  黑名单解析: %d 个 user_id", len(blacklist_ids))
+
+    # 7. 计算差集
     mutual_count = sum(1 for uid in following_ids if uid in followers_ids)
     non_mutual = [
         following_ids[uid]
@@ -647,10 +701,12 @@ def main() -> None:
     # 关注了你但你未回关的人（粉丝列表中不在关注列表中的）
     not_followed_back = [u for u in followers if u["id"] not in following_ids]
     actionable = [u for u in non_mutual if u["id"] not in whitelist_ids]
+    # 回关候选：排除黑名单
+    followback_candidates = [u for u in not_followed_back if u["id"] not in blacklist_ids]
 
     print_results(
         len(following), len(followers), mutual_count,
-        non_mutual, whitelist_ids, not_followed_back,
+        non_mutual, whitelist_ids, not_followed_back, blacklist_ids,
     )
 
     # 7. 加载断点状态
@@ -672,12 +728,13 @@ def main() -> None:
         print()
         print("──── 回关 ────")
         print(f"  [LF] 列出你未回关的粉丝 ({len(not_followed_back)} 人)")
-        if not_followed_back:
-            remaining_fb = len(not_followed_back) - len(state.get("followed", []))
+        if followback_candidates:
+            remaining_fb = len(followback_candidates) - len(state.get("followed", []))
             print(f"  [F]  执行回关 ({remaining_fb} 人待处理)")
         print()
         print("──── 其他 ────")
         print("  [W]  添加用户到白名单")
+        print("  [B]  添加用户到黑名单")
         print("  [Q]  退出")
         print()
 
@@ -691,7 +748,7 @@ def main() -> None:
             list_non_mutual(non_mutual, whitelist_ids)
 
         elif choice == "LF":
-            list_non_mutual(not_followed_back, set())
+            list_non_mutual(not_followed_back, set(), blacklist_ids)
 
         elif choice == "D":
             print(f"\n即将取关以下 {len(actionable)} 人（dry-run，不会执行）：")
@@ -712,10 +769,10 @@ def main() -> None:
             state = load_state()
 
         elif choice == "F":
-            if not not_followed_back:
+            if not followback_candidates:
                 print("没有需要回关的用户。")
                 continue
-            remaining_fb = [u for u in not_followed_back if u["id"] not in state.get("followed", [])]
+            remaining_fb = [u for u in followback_candidates if u["id"] not in state.get("followed", [])]
             if not remaining_fb:
                 print("所有用户已回关完毕！")
                 continue
@@ -727,6 +784,11 @@ def main() -> None:
             name = input("输入要加入白名单的用户名: ").strip()
             if name:
                 add_to_whitelist(name)
+
+        elif choice == "B":
+            name = input("输入要加入黑名单的用户名: ").strip()
+            if name:
+                add_to_blacklist(name)
 
         elif choice == "Q":
             print("退出。")
