@@ -499,6 +499,9 @@ def list_non_mutual(
     print()
 
 
+_BATCH_LIMIT = 10  # 单次操作上限，避免触发 X 批量限制
+
+
 def confirm_action(prompt: str) -> bool:
     """用户确认操作。"""
     try:
@@ -513,16 +516,22 @@ def execute_unfollow(
     actionable: list[dict[str, Any]],
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    """执行批量取关。"""
+    """执行批量取关（每轮最多 10 人）。"""
     total = len(actionable)
     unfollowed = state.get("unfollowed", [])
     errors = state.get("errors", [])
 
-    print(f"\n准备取关 {total} 人...")
-    print(f"  已取关: {len(unfollowed)} 人")
-    print(f"  剩余:   {total - len(unfollowed)} 人")
+    # 限制单次操作数量
+    if total > _BATCH_LIMIT:
+        actionable = actionable[:_BATCH_LIMIT]
+        log.warning("⚠️  单次上限 %d 人，已截取前 %d 人（共 %d 人可分多轮执行）",
+                     _BATCH_LIMIT, _BATCH_LIMIT, total)
 
-    if not confirm_action(f"确定要取关这 {total - len(unfollowed)} 人吗？"):
+    print(f"\n准备取关 {len(actionable)} 人...")
+    print(f"  已取关: {len(unfollowed)} 人")
+    print(f"  剩余:   {len(actionable) - len([u for u in actionable if u['id'] in unfollowed])} 人")
+
+    if not confirm_action(f"确定要取关这 {len(actionable)} 人吗？"):
         print("  已取消。")
         return state
 
@@ -535,7 +544,7 @@ def execute_unfollow(
             continue
 
         # 进度显示
-        progress = f"[{i + 1}/{total}]"
+        progress = f"[{i + 1}/{len(actionable)}]"
         print(f"  {progress} 取关 @{username}...", end=" ", flush=True)
 
         if x.unfollow_user(uid):
@@ -550,13 +559,8 @@ def execute_unfollow(
         state["errors"] = errors
         save_state(state)
 
-        # 每 50 人暂停 30 秒
-        if (i + 1) % 50 == 0 and i + 1 < total:
-            print(f"  ⏸  已取关 {i + 1}/{total}，暂停 30 秒...")
-            time.sleep(30)
-
         # 每次取关间隔 1 秒
-        if i + 1 < total:
+        if i + 1 < len(actionable):
             time.sleep(1.0)
 
     print(f"\n✅ 取关完成: {len(unfollowed)} 成功, {len(errors)} 失败")
@@ -568,16 +572,22 @@ def execute_followback(
     to_follow: list[dict[str, Any]],
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    """执行批量回关。"""
+    """执行批量回关（每轮最多 10 人）。"""
     total = len(to_follow)
     followed = state.get("followed", [])
     errors = state.get("follow_errors", [])
 
-    print(f"\n准备回关 {total} 人...")
-    print(f"  已回关: {len(followed)} 人")
-    print(f"  剩余:   {total - len(followed)} 人")
+    # 限制单次操作数量
+    if total > _BATCH_LIMIT:
+        to_follow = to_follow[:_BATCH_LIMIT]
+        log.warning("⚠️  单次上限 %d 人，已截取前 %d 人（共 %d 人可分多轮执行）",
+                     _BATCH_LIMIT, _BATCH_LIMIT, total)
 
-    if not confirm_action(f"确定要回关这 {total - len(followed)} 人吗？"):
+    print(f"\n准备回关 {len(to_follow)} 人...")
+    print(f"  已回关: {len(followed)} 人")
+    print(f"  剩余:   {len(to_follow) - len([u for u in to_follow if u['id'] in followed])} 人")
+
+    if not confirm_action(f"确定要回关这 {len(to_follow)} 人吗？"):
         print("  已取消。")
         return state
 
@@ -590,7 +600,7 @@ def execute_followback(
             continue
 
         # 进度显示
-        progress = f"[{i + 1}/{total}]"
+        progress = f"[{i + 1}/{len(to_follow)}]"
         print(f"  {progress} 回关 @{username}...", end=" ", flush=True)
 
         if x.follow_user(uid):
@@ -605,12 +615,9 @@ def execute_followback(
         state["follow_errors"] = errors
         save_state(state)
 
-        # 每 50 人暂停 30 秒
-        if (i + 1) % 50 == 0 and i + 1 < total:
-            print(f"  ⏸  已回关 {i + 1}/{total}，暂停 30 秒...")
-            time.sleep(30)
-
         # 每次回关间隔 1 秒
+        if i + 1 < len(to_follow):
+            time.sleep(1.0)
         if i + 1 < total:
             time.sleep(1.0)
 
